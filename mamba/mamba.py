@@ -241,8 +241,7 @@ class MambaBlock(nn.Module):
         BX = deltaB * (x.unsqueeze(-1)) # (B, L, ED, N)
 
         if h0 is not None:
-            B0 = deltaA[:, :1] * h0 + BX[:, :1]
-            BX = torch.cat([B0, BX[:, 1:]], dim=1)
+            BX[:, :1].add_(deltaA[:, :1] * h0)
         
         hs = pscan(deltaA, BX)
 
