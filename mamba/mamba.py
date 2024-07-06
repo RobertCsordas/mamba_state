@@ -2,7 +2,7 @@
 
 import math
 from dataclasses import dataclass
-from typing import Union
+from typing import Union, Optional, Dict, Tuple
 
 import torch
 import torch.nn as nn
@@ -57,6 +57,8 @@ class MambaConfig:
         if self.dt_rank == 'auto':
             self.dt_rank = math.ceil(self.d_model / 16)
 
+MambaCahce = Dict[int, Tuple[torch.Tensor,torch.Tensor]]
+
 class Mamba(nn.Module):
     def __init__(self, config: MambaConfig):
         super().__init__()
@@ -65,15 +67,16 @@ class Mamba(nn.Module):
 
         self.layers = nn.ModuleList([ResidualBlock(config) for _ in range(config.n_layers)])
 
-    def forward(self, x, caches = None):
+    def forward(self, x: torch.Tensor, caches: Optional[MambaCahce] = None, lengths: Optional[torch.Tensor] = None) -> Union[torch.Tensor, Tuple[torch.Tensor, MambaCahce]]:
         # x : (B, L, D)
-
-        # y : (B, L, D)
+        # if caches is not None, it is a dict of tuples (h, inputs) where h is the last hidden state and inputs is the last d_conv-1 projected inputs. The keys are the layer indices. To initialize, pass caches = {}.
+        # lengths : (B) lengths of each sequence in x
+        # output: (B, L, D)
 
         new_caches = {}
         for i, layer in enumerate(self.layers):
             cache = caches.get(i) if caches is not None else None
-            x, new_caches[i] = layer(x, cache)
+            x, new_caches[i] = layer(x, cache, lengths)
 
         if caches is not None:
             return x, new_caches
@@ -88,14 +91,15 @@ class ResidualBlock(nn.Module):
         self.mixer = MambaBlock(config)
         self.norm = RMSNorm(config.d_model, config.rms_norm_eps)
 
-    def forward(self, x, cache):
+    def forward(self, x, cache, lengths):
         # x : (B, L, D)
 
         # output : (B, L, D)
 
-        output, new_cache = self.mixer(self.norm(x), cache)
+        output, new_cache = self.mixer(self.norm(x), cache, lengths)
         output = output + x
         return output, new_cache
+
 
 class MambaBlock(nn.Module):
     def __init__(self, config: MambaConfig):
@@ -167,12 +171,13 @@ class MambaBlock(nn.Module):
             C = self.C_layernorm(C)
         return dt, B, C
 
-    def forward(self, x, cache):
+    def forward(self, x, cache, lengths=None):
         # x : (B, L, D)
         
         # y : (B, L, D)
+        # lengths: (B)
 
-        _, L, _ = x.shape
+        B, L, _ = x.shape
         new_cache = {}
 
         xz = self.in_proj(x) # (B, L, 2*ED)
@@ -200,7 +205,22 @@ class MambaBlock(nn.Module):
         output = y * z
         output = self.out_proj(output) # (B, L, D)
 
-        new_cache = (hs[:,-1:], xin[..., -(self.config.d_conv-1):])
+        if lengths is None:
+            new_cache = (hs[:,-1:], xin[..., -(self.config.d_conv-1):])
+        else:
+            sh = list(hs.shape)
+            sh[1] = 1
+            
+            h = torch.gather(hs, 1, (lengths.view([-1] + [1] * (hs.ndim-1))-1).expand(sh))
+
+            sh = list(xin.shape)
+            sh[-1] = self.config.d_conv-1          
+            xls = torch.arange(-(self.config.d_conv-1), 0, device=h.device, dtype=lengths.dtype)[None,None] + lengths[:, None, None]
+            xls = xls.expand(sh)
+            xin2 = torch.gather(xin, 2, xls.view(*sh).clamp(0))
+            xin2 = torch.masked_fill(xin2, xls < 0, 0)
+
+            new_cache = (h, xin2)
 
         return output, new_cache
     
