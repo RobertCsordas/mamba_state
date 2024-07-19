@@ -51,6 +51,8 @@ class MambaConfig:
     conv_bias: bool = True
     inner_layernorms: bool = False # apply layernorms to internal activations
 
+    zero_gates: bool = False
+
     def __post_init__(self):
         self.d_inner = self.expand_factor * self.d_model # E*D = ED in comments
 
@@ -64,7 +66,6 @@ class Mamba(nn.Module):
         super().__init__()
 
         self.config = config
-
         self.layers = nn.ModuleList([ResidualBlock(config) for _ in range(config.n_layers)])
 
     def forward(self, x: torch.Tensor, caches: Optional[MambaCahce] = None, lengths: Optional[torch.Tensor] = None) -> Union[torch.Tensor, Tuple[torch.Tensor, MambaCahce]]:
@@ -82,7 +83,7 @@ class Mamba(nn.Module):
             return x, new_caches
         else:
             return x
-    
+
 
 class ResidualBlock(nn.Module):
     def __init__(self, config: MambaConfig):
@@ -110,11 +111,11 @@ class MambaBlock(nn.Module):
         # projects block input from D to 2*ED (two branches)
         self.in_proj = nn.Linear(config.d_model, 2 * config.d_inner, bias=config.bias)
 
-        self.conv1d = nn.Conv1d(in_channels=config.d_inner, out_channels=config.d_inner, 
-                              kernel_size=config.d_conv, bias=config.conv_bias, 
+        self.conv1d = nn.Conv1d(in_channels=config.d_inner, out_channels=config.d_inner,
+                              kernel_size=config.d_conv, bias=config.conv_bias,
                               groups=config.d_inner,
                               padding=config.d_conv - 1)
-        
+
         # projects x to input-dependent delta, B, C
         self.x_proj = nn.Linear(config.d_inner, config.dt_rank + 2 * config.d_state, bias=False)
 
@@ -130,7 +131,7 @@ class MambaBlock(nn.Module):
             nn.init.uniform_(self.dt_proj.weight, -dt_init_std, dt_init_std)
         else:
             raise NotImplementedError
-        
+
         # delta bias
         dt = torch.exp(
             torch.rand(config.d_inner) * (math.log(config.dt_max) - math.log(config.dt_min)) + math.log(config.dt_min)
@@ -173,7 +174,7 @@ class MambaBlock(nn.Module):
 
     def forward(self, x, cache, lengths=None):
         # x : (B, L, D)
-        
+
         # y : (B, L, D)
         # lengths: (B)
 
@@ -210,11 +211,11 @@ class MambaBlock(nn.Module):
         else:
             sh = list(hs.shape)
             sh[1] = 1
-            
+
             h = torch.gather(hs, 1, (lengths.view([-1] + [1] * (hs.ndim-1))-1).expand(sh))
 
             sh = list(xin.shape)
-            sh[-1] = self.config.d_conv-1          
+            sh[-1] = self.config.d_conv-1
             xls = torch.arange(-(self.config.d_conv-1), 0, device=h.device, dtype=lengths.dtype)[None,None] + lengths[:, None, None]
             xls = xls.expand(sh)
             xin2 = torch.gather(xin, 2, xls.view(*sh).clamp(0))
@@ -223,7 +224,7 @@ class MambaBlock(nn.Module):
             new_cache = (h, xin2)
 
         return output, new_cache
-    
+
     def ssm(self, x, z, h0):
         # x : (B, L, ED)
 
@@ -238,13 +239,13 @@ class MambaBlock(nn.Module):
         delta = self.dt_proj.weight @ delta.transpose(1, 2) # (ED, dt_rank) @ (B, L, dt_rank) -> (B, ED, L)
         # here we just apply the matrix mul operation of delta = softplus(dt_proj(delta))
         # the rest will be applied later (fused if using cuda)
-        
+
         # choose which selective_scan function to use, according to config
         delta = delta.transpose(1, 2)
         delta = F.softplus(delta + self.dt_proj.bias)
 
         return self.selective_scan(x, delta, A, B, C, D, h0)
-    
+
     def selective_scan(self, x, delta, A, B, C, D, h0):
         # x : (B, L, ED)
         # Δ : (B, L, ED)
@@ -262,7 +263,10 @@ class MambaBlock(nn.Module):
 
         if h0 is not None:
             BX[:, :1].add_(deltaA[:, :1] * h0)
-        
+
+        if self.config.zero_gates:
+            deltaA = torch.ones_like(deltaA)
+
         hs = pscan(deltaA, BX)
 
         y = (hs @ C.unsqueeze(-1)).squeeze(3) # (B, L, ED, N) @ (B, L, N, 1) -> (B, L, ED, 1)
@@ -270,7 +274,7 @@ class MambaBlock(nn.Module):
         y = y + D * x
 
         return y, hs
-    
+
 
 # taken straight from https://github.com/johnma2006/mamba-minimal/blob/master/model.py
 class RMSNorm(nn.Module):
@@ -284,4 +288,3 @@ class RMSNorm(nn.Module):
         output = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) * self.weight
 
         return output
-    
